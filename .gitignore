@@ -1,0 +1,11 @@
+# Exclude proprietary AMD driver installer and extracted driver binaries
+AMDDriver.exe
+*.exe
+DRIVERS/
+
+# Exclude locally generated certificates and private keys
+*.pfx
+*.cer
+*.cat
+*.cdf
+*.bak
