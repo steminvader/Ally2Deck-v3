@@ -90,3 +90,5 @@ To remove the driver package and catalog certificate, right-click **`UninstallDr
 
 ## Disclaimer
 AMD drivers are proprietary software owned by Advanced Micro Devices, Inc. This repository does **not** redistribute any AMD binaries—only automation scripts that patch your locally downloaded copy. Use at your own risk.
+
+MADE BY ARGON 4
