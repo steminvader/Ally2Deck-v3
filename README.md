@@ -82,6 +82,71 @@ To remove the driver package and catalog certificate, right-click **`UninstallDr
 
 ---
 
+## Known Issue: Black Screen After Sleep / Wake (fix included)
+
+Some Steam Deck units come back from sleep (Modern Standby / S0ix or S3) with **no display attached to the GPU**.
+That is a display *topology* problem, not a whitelist or signature problem: the kernel driver loads fine, but it does not re-enumerate the internal eDP panel after the power transition, so Windows sees zero display targets:
+
+| Call | Result | Meaning |
+| --- | --- | --- |
+| `ChangeDisplaySettings(NULL, NULL, CDS_RESET)` | `-1` (`DISP_CHANGE_FAILED`) | GDI has no display to reset |
+| `SetDisplayConfig(..., SDC_APPLY)` | `87` (`ERROR_INVALID_PARAMETER`) | there are zero valid display paths |
+
+The only reliable recovery is to make the driver re-run its start routine and re-train the panel, then re-apply the topology. Doing that once, three seconds after wake, with no verification, is why the old workaround only worked on the *second* wake.
+
+### Install the automatic fix (one time)
+
+1. Keep **`InstallWakeFix.ps1`** and **`FixDisplayWake.ps1`** in the same folder.
+2. Right-click **`InstallWakeFix.ps1`** -> **Run with PowerShell** (it self-elevates).
+3. Done. From now on the fix runs automatically after every resume from sleep.
+
+Remove it again with:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\InstallWakeFix.ps1 -Uninstall
+```
+
+### What the fix does
+
+`FixDisplayWake.ps1` replaces the fire-and-forget approach with a checked loop:
+
+1. Waits for the power manager and KMD to finish resuming (`-DelaySeconds`, default 4).
+2. Reads the real display state through `GetDisplayConfigBufferSizes` / `QueryDisplayConfig`:
+   - **no targets at all** (`QDC_ALL_PATHS` = 0) means the driver never enumerated the panel -> the adapter has to be restarted;
+   - **targets but none active** (`QDC_ALL_PATHS` > 0, `QDC_ONLY_ACTIVE_PATHS` = 0) means a topology re-apply is enough.
+3. Sends `SC_MONITORPOWER = -1` (panel out of DPMS off) and `CDS_RESET` to force GDI to re-enumerate.
+4. Re-applies the topology in order of least damage: last-known-good -> `SDC_TOPOLOGY_INTERNAL` -> `SDC_TOPOLOGY_EXTEND`, verifying after each step.
+5. If the driver still reports zero targets, restarts the display adapter (`pnputil /restart-device`, falling back to `Disable-PnpDevice` / `Enable-PnpDevice` on older builds), **waits until the driver re-enumerates a target**, and applies the topology again.
+6. Retries the whole sequence until a display is active or `-TimeoutSeconds` (default 120) expires, then logs the outcome.
+
+Every restart is capped (2) and every step is verified, so it exits as soon as the picture is back instead of blindly cycling the GPU.
+
+### Manual use / troubleshooting
+
+```powershell
+# Show the current state, changes nothing
+powershell -NoProfile -ExecutionPolicy Bypass -File .\FixDisplayWake.ps1 -Diagnose
+
+# Run the fix now
+powershell -NoProfile -ExecutionPolicy Bypass -File .\FixDisplayWake.ps1
+
+# Never touch the adapter, only re-apply the topology
+powershell -NoProfile -ExecutionPolicy Bypass -File .\FixDisplayWake.ps1 -NoRestart
+
+# Trigger the scheduled task by hand
+Start-ScheduledTask -TaskName Ally2Deck-FixDisplayWake
+```
+
+Log: `%ProgramData%\Ally2Deck\display-wake.log`
+
+Notes:
+
+- The task is registered for the **interactive user** with highest privileges by default, because the display configuration APIs are per-session (session 0 cannot apply a topology to your desktop). Use `-RunAsSystem` if you prefer, but the adapter restart is the only part that is fully reliable from session 0.
+- An adapter restart blanks the screen for a few seconds. That is expected - it is the same re-initialisation a reboot performs, just without the reboot.
+- If the log still ends with `Display was NOT restored`, the panel did not come back at all: attach the log and your GPU revision (`REV_AE` = LCD, `REV_E1` = OLED) to the issue tracker. A hibernation-based workaround (`shutdown /h`) avoids the affected resume path in the meantime.
+
+---
+
 ## Credits
 
 - Original research & AMD driver analysis by [otti83](https://github.com/otti83/apu_driver_test)
