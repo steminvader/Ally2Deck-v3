@@ -1,53 +1,75 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Resident resume listener for the Ally2Deck sleep/wake display fix.
+    Resident resume listener with FORCED display recovery for Ally2Deck.
 
 .DESCRIPTION
-    These handhelds run Modern Standby (S0 Low Power Idle), not legacy S3 sleep.
-    On Modern Standby the kernel never writes Microsoft-Windows-Power-Troubleshooter
-    Event 1 or Kernel-Power Event 107, so a scheduled task triggered on those events
-    can never fire - the task sits at LastTaskResult 267011 (0x41303) forever and the
-    display recovery never runs. Resume is recorded as Kernel-Power Event 507
-    ("exiting connected standby") instead.
+    Why this exists, in order:
 
-    This script stays resident in the interactive session and waits for the
-    WM_POWERBROADCAST resume notification, which Windows delivers on every resume
-    regardless of the sleep model. When one arrives it launches FixDisplayWake.ps1.
+    1. The original fix used scheduled tasks triggered on Power-Troubleshooter Event 1 and
+       Kernel-Power Event 107. On units that resume from Modern Standby those events are
+       never written, so the task never fired (LastTaskResult 267011 forever). On units that
+       use S3 they ARE written, but a CIM/WMI subscription on the System log is unreliable
+       and can also never fire. Either way the recovery never ran.
+
+    2. This listener does not depend on the event log at all. It stays resident in the
+       interactive session and reacts to the WM_POWERBROADCAST resume notification, which
+       Windows delivers on every resume regardless of the sleep model.
+
+    3. The old recovery script bailed out early when QueryDisplayConfig reported an active
+       path:
+
+           if ($bp.Active -gt 0) { 'Display is already active, nothing to do.'; exit }
+
+       That test cannot detect the actual failure. After the KMD loses the internal eDP link,
+       Windows keeps listing the panel as an active path in its cached display config, so the
+       screen is black while every API says it is fine. The recovery then exits without doing
+       anything, which is why the log said "already active" on a black screen.
+
+    So on resume this listener ALWAYS runs the full recovery sequence - panel power-on, GDI
+    re-enumeration, topology re-apply, and (unless -NoRestart) an adapter restart - instead of
+    asking the OS whether it thinks the display is fine.
 
 .PARAMETER Install
-    Copy the script to %ProgramData%\Ally2Deck and register a logon task so the
-    listener starts with the session. Self-elevates.
+    Copy the script to %ProgramData%\Ally2Deck and register a logon task. Self-elevates.
 
 .PARAMETER Uninstall
     Stop the listener, unregister its task and delete the installed copy.
 
-.PARAMETER DelaySeconds
-    Settle time passed to FixDisplayWake.ps1. Default 5.
+.PARAMETER Test
+    Run the forced recovery once, right now, and exit. Use this to check that the sequence
+    works on a healthy desktop before relying on it after a wake. The screen blanks for a few
+    seconds while the adapter restarts - that is expected.
+
+.PARAMETER NoRestart
+    Never restart the display adapter. Only power the panel on and re-apply the topology.
 
 .EXAMPLE
     powershell -NoProfile -ExecutionPolicy Bypass -File .\FixDisplayWakeListener.ps1 -Install
 
 .EXAMPLE
-    powershell -NoProfile -ExecutionPolicy Bypass -File .\FixDisplayWakeListener.ps1
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\FixDisplayWakeListener.ps1 -Test
 #>
 [CmdletBinding()]
 param(
     [switch]$Install,
     [switch]$Uninstall,
+    [switch]$Test,
     [string]$InstallDir = "$env:ProgramData\Ally2Deck",
     [string]$LogPath = "$env:ProgramData\Ally2Deck\wake-listener.log",
-    [int]$DelaySeconds = 5,
+    [int]$DelaySeconds = 4,
     [int]$DebounceSeconds = 20,
+    [int]$TimeoutSeconds = 90,
+    [switch]$NoRestart,
     [string]$TargetUser = "$env:USERDOMAIN\$env:USERNAME"
 )
 
-$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = 'Continue'
+$ProgressPreference = 'SilentlyContinue'
 
-$TaskName     = 'Ally2Deck-DisplayWakeListener'
-$LegacyTask   = 'Ally2Deck-FixDisplayWake'
-$ScriptName   = 'FixDisplayWakeListener.ps1'
-$RecoveryName = 'FixDisplayWake.ps1'
+$TaskName = 'Ally2Deck-DisplayWakeListener'
+$LegacyTask = 'Ally2Deck-FixDisplayWake'
+$ScriptName = 'FixDisplayWakeListener.ps1'
 
 function Write-Log {
     param(
@@ -60,7 +82,7 @@ function Write-Log {
     try {
         $dir = Split-Path -Parent $LogPath
         if ($dir -and -not (Test-Path -LiteralPath $dir)) {
-            $null = New-Item -ItemType Directory -Path $dir -Force
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
         }
         Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
     }
@@ -84,20 +106,277 @@ function Invoke-ElevatedSelf {
         -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" $Arguments"
 }
 
-function Get-RecoveryScript {
-    $candidates = @(
-        (Join-Path -Path $PSScriptRoot -ChildPath $RecoveryName),
-        (Join-Path -Path $InstallDir -ChildPath $RecoveryName)
-    )
+# -------------------------------------------------------------------------------------------------
+# Win32 display helpers
+# -------------------------------------------------------------------------------------------------
 
-    foreach ($candidate in $candidates) {
-        if ($candidate -and (Test-Path -LiteralPath $candidate)) {
-            return (Resolve-Path -LiteralPath $candidate).Path
+$displayApiSource = @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class AllyForcedDisplay
+{
+    private const uint QDC_ALL_PATHS         = 0x00000001;
+    private const uint QDC_ONLY_ACTIVE_PATHS = 0x00000002;
+
+    public const uint SDC_TOPOLOGY_INTERNAL = 0x00000001;
+    public const uint SDC_TOPOLOGY_EXTEND   = 0x00000004;
+    public const uint SDC_APPLY             = 0x00000080;
+    public const uint SDC_NO_OPTIMIZATION   = 0x00000100;
+    public const uint SDC_SAVE_TO_DATABASE  = 0x00000200;
+    public const uint SDC_ALLOW_CHANGES     = 0x00000400;
+
+    [DllImport("user32.dll")]
+    private static extern int GetDisplayConfigBufferSizes(uint flags, out uint paths, out uint modes);
+
+    [DllImport("user32.dll")]
+    private static extern int QueryDisplayConfig(uint flags, ref uint paths, IntPtr pathArray,
+        ref uint modes, IntPtr modeArray, IntPtr topologyId);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int ChangeDisplaySettingsEx(string deviceName, IntPtr devMode,
+        IntPtr hwnd, uint flags, IntPtr param);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint msg, IntPtr wParam,
+        IntPtr lParam, uint flags, uint timeout, out IntPtr result);
+
+    private static int CountPaths(uint flags)
+    {
+        uint pathCount = 0;
+        uint modeCount = 0;
+
+        if (GetDisplayConfigBufferSizes(flags, out pathCount, out modeCount) != 0) { return -1; }
+        if (pathCount == 0) { return 0; }
+
+        IntPtr pathBuffer = IntPtr.Zero;
+        IntPtr modeBuffer = IntPtr.Zero;
+
+        try
+        {
+            pathBuffer = Marshal.AllocHGlobal((int)pathCount * 256);
+            modeBuffer = Marshal.AllocHGlobal((int)(modeCount == 0 ? 1 : modeCount) * 128);
+
+            uint pCount = pathCount;
+            uint mCount = modeCount;
+
+            if (QueryDisplayConfig(flags, ref pCount, pathBuffer, ref mCount, modeBuffer, IntPtr.Zero) != 0)
+            {
+                return -1;
+            }
+
+            return (int)pCount;
+        }
+        finally
+        {
+            if (pathBuffer != IntPtr.Zero) { Marshal.FreeHGlobal(pathBuffer); }
+            if (modeBuffer != IntPtr.Zero) { Marshal.FreeHGlobal(modeBuffer); }
         }
     }
 
-    return $null
+    // [available, active]
+    public static int[] GetCounts()
+    {
+        return new int[] { CountPaths(QDC_ALL_PATHS), CountPaths(QDC_ONLY_ACTIVE_PATHS) };
+    }
+
+    public static int ResetDisplaySettings()
+    {
+        return ChangeDisplaySettingsEx(null, IntPtr.Zero, IntPtr.Zero, 0x40000000, IntPtr.Zero);
+    }
+
+    public static void WakeMonitor()
+    {
+        IntPtr result;
+        SendMessageTimeout(new IntPtr(0xFFFF), 0x0112, new IntPtr(0xF170), new IntPtr(-1), 0x0002, 2000, out result);
+    }
+
+    public static int ApplyLastKnownGood()
+    {
+        return SetDisplayConfig(0, IntPtr.Zero, 0, IntPtr.Zero,
+            SDC_APPLY | SDC_NO_OPTIMIZATION | SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE);
+    }
+
+    public static int ApplyInternal()
+    {
+        return SetDisplayConfig(0, IntPtr.Zero, 0, IntPtr.Zero,
+            SDC_TOPOLOGY_INTERNAL | SDC_APPLY | SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE);
+    }
+
+    public static int ApplyExtend()
+    {
+        return SetDisplayConfig(0, IntPtr.Zero, 0, IntPtr.Zero,
+            SDC_TOPOLOGY_EXTEND | SDC_APPLY | SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE);
+    }
+
+    [DllImport("user32.dll")]
+    private static extern int SetDisplayConfig(uint pathCount, IntPtr paths,
+        uint modeCount, IntPtr modes, uint flags);
 }
+'@
+
+try {
+    if (-not ('AllyForcedDisplay' -as [type])) {
+        Add-Type -TypeDefinition $displayApiSource -Language CSharp -ErrorAction Stop
+    }
+}
+catch {
+    Write-Log 'ERROR' "Failed to compile the display helper: $($_.Exception.Message)"
+    exit 3
+}
+
+function Get-AllyGpuDevice {
+    $devices = @(Get-PnpDevice -Class Display -ErrorAction SilentlyContinue)
+    if ($devices.Count -eq 0) { return $null }
+
+    $amd = @($devices | Where-Object {
+        $_.InstanceId -match 'VEN_1002' -or $_.FriendlyName -match 'Radeon'
+    })
+
+    if ($amd.Count -gt 0) { return ($amd | Select-Object -First 1) }
+    return ($devices | Select-Object -First 1)
+}
+
+function Get-PathCounts {
+    $counts = [AllyForcedDisplay]::GetCounts()
+    return [pscustomobject]@{
+        Available = $counts[0]
+        Active    = $counts[1]
+    }
+}
+
+function Invoke-TopologyPass {
+    $steps = @(
+        @{ Name = 'last-known-good'; Result = [AllyForcedDisplay]::ApplyLastKnownGood() },
+        @{ Name = 'internal';        Result = [AllyForcedDisplay]::ApplyInternal() },
+        @{ Name = 'extend';          Result = [AllyForcedDisplay]::ApplyExtend() }
+    )
+
+    foreach ($step in $steps) {
+        Write-Log 'DEBUG' ("SetDisplayConfig({0}) -> {1}" -f $step.Name, $step.Result)
+        if ($step.Result -eq 0) { Start-Sleep -Milliseconds 900 }
+    }
+}
+
+function Wait-ForTargets {
+    param([int]$Seconds = 30)
+
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    while ((Get-Date) -lt $deadline) {
+        $state = Get-PathCounts
+        if ($state.Available -gt 0) {
+            Write-Log 'INFO' "Driver re-enumerated $($state.Available) display target(s)."
+            return $true
+        }
+        Start-Sleep -Milliseconds 750
+    }
+
+    return $false
+}
+
+function Restart-DisplayAdapter {
+    param([Parameter(Mandatory = $true)]$Device)
+
+    $instanceId = $Device.InstanceId
+    Write-Log 'WARN' "Restarting display adapter: $instanceId"
+
+    $pnputil = Join-Path $env:SystemRoot 'System32\pnputil.exe'
+    if (Test-Path -LiteralPath $pnputil) {
+        $output = & $pnputil /restart-device "$instanceId" 2>&1
+        $code = $LASTEXITCODE
+        $text = ($output | Out-String).Trim()
+        if ($text) { Write-Log 'DEBUG' "pnputil: $text" }
+        Write-Log 'INFO' "pnputil /restart-device exited with code $code."
+        if ($code -eq 0) { return (Wait-ForTargets -Seconds 30) }
+    }
+
+    Write-Log 'WARN' 'Falling back to Disable-PnpDevice / Enable-PnpDevice.'
+    try {
+        Disable-PnpDevice -InstanceId $instanceId -Confirm:$false -ErrorAction Stop
+    }
+    catch {
+        Write-Log 'ERROR' "Disable-PnpDevice failed: $($_.Exception.Message)"
+        return $false
+    }
+
+    Start-Sleep -Seconds 2
+
+    for ($i = 1; $i -le 10; $i++) {
+        try {
+            Enable-PnpDevice -InstanceId $instanceId -Confirm:$false -ErrorAction Stop
+            return (Wait-ForTargets -Seconds 25)
+        }
+        catch {
+            Write-Log 'WARN' "Enable-PnpDevice attempt $i failed: $($_.Exception.Message)"
+            Start-Sleep -Seconds 2
+        }
+    }
+
+    return $false
+}
+
+# Runs the sequence unconditionally. It does not ask whether the display looks active,
+# because that question is what made the old script skip every recovery step.
+function Invoke-ForcedRecovery {
+    param([string]$Reason = 'resume')
+
+    $started = Get-Date
+    $gpu = Get-AllyGpuDevice
+
+    if (-not $gpu) {
+        Write-Log 'ERROR' "$Reason : no display adapter found (is the driver loaded?)."
+        return 2
+    }
+
+    $before = Get-PathCounts
+    Write-Log 'INFO' "$Reason : GPU $($gpu.FriendlyName) status=$($gpu.Status); paths available=$($before.Available) active=$($before.Active)"
+
+    $restarts = 0
+
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        # 1) Panel out of DPMS off, and make GDI re-enumerate from the driver.
+        [AllyForcedDisplay]::WakeMonitor()
+        $reset = [AllyForcedDisplay]::ResetDisplaySettings()
+        Write-Log 'DEBUG' "Attempt #$attempt CDS_RESET -> $reset"
+
+        # 2) Re-apply the topology.
+        Invoke-TopologyPass
+
+        Start-Sleep -Milliseconds 1200
+
+        # 3) Last resort: make the driver re-run its start routine and re-train eDP.
+        if ($NoRestart) {
+            Write-Log 'WARN' 'NoRestart is set, so the adapter will not be restarted.'
+            break
+        }
+
+        if ($restarts -ge 2) {
+            Write-Log 'WARN' 'Adapter already restarted twice; stopping here.'
+            break
+        }
+
+        $restarts++
+        Write-Log 'INFO' "Attempt #$attempt adapter restart $restarts of 2."
+        [void](Restart-DisplayAdapter -Device $gpu)
+
+        # A restart leaves the panel powered down often enough that the sequence has to repeat.
+        [AllyForcedDisplay]::WakeMonitor()
+        [void][AllyForcedDisplay]::ResetDisplaySettings()
+        Invoke-TopologyPass
+
+        Start-Sleep -Milliseconds 1500
+    }
+
+    $after = Get-PathCounts
+    $elapsed = [int]((Get-Date) - $started).TotalSeconds
+    Write-Log 'OK' "$Reason : forced recovery finished in $elapsed s after $restarts adapter restart(s); paths available=$($after.Available) active=$($after.Active). If the picture is back, sleep/wake again to confirm it repeats."
+
+    return 0
+}
+
+# -------------------------------------------------------------------------------------------------
+# Install / uninstall
+# -------------------------------------------------------------------------------------------------
 
 function Install-Listener {
     if (-not (Test-IsAdmin)) {
@@ -115,19 +394,7 @@ function Install-Listener {
         Copy-Item -LiteralPath $PSCommandPath -Destination $destination -Force
     }
 
-    $recovery = Get-RecoveryScript
-    if (-not $recovery) {
-        Write-Log 'ERROR' "Cannot find $RecoveryName next to $ScriptName or in $InstallDir. Put both files in the same folder, then run -Install again."
-        return
-    }
-
-    $installedRecovery = Join-Path -Path $InstallDir -ChildPath $RecoveryName
-    if ($recovery -ne $installedRecovery) {
-        Copy-Item -LiteralPath $recovery -Destination $installedRecovery -Force
-    }
-
-    # The event-log task can never fire on Modern Standby. Disable it rather than
-    # delete it, so it stays available for troubleshooting and -Uninstall can revert.
+    # The event-log task can never be relied on. Disable it rather than delete it.
     $legacy = Get-ScheduledTask -TaskName $LegacyTask -ErrorAction SilentlyContinue
     if ($legacy -and $legacy.State -ne 'Disabled') {
         Disable-ScheduledTask -TaskName $LegacyTask -ErrorAction SilentlyContinue | Out-Null
@@ -139,14 +406,18 @@ function Install-Listener {
 
     $action = New-ScheduledTaskAction -Execute $powershell -Argument $arguments
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $TargetUser
-    $settings = New-ScheduledTaskSettingsSet `
-        -AllowStartIfOnBatteries `
-        -DontStopIfGoingOnBatteries `
-        -StartWhenAvailable `
-        -ExecutionTimeLimit ([TimeSpan]::Zero) `
-        -MultipleInstances IgnoreNew `
-        -RestartCount 3 `
-        -RestartInterval (New-TimeSpan -Minutes 1)
+
+    $settingsParams = @{
+        AllowStartIfOnBatteries    = $true
+        DontStopIfGoingOnBatteries = $true
+        StartWhenAvailable         = $true
+        ExecutionTimeLimit         = [TimeSpan]::Zero
+        MultipleInstances          = 'IgnoreNew'
+        RestartCount               = 3
+        RestartInterval            = (New-TimeSpan -Minutes 1)
+    }
+    $settings = New-ScheduledTaskSettingsSet @settingsParams
+
     $principal = New-ScheduledTaskPrincipal -UserId $TargetUser -LogonType Interactive -RunLevel Highest
 
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
@@ -158,9 +429,10 @@ function Install-Listener {
     $task = Get-ScheduledTask -TaskName $TaskName
     Write-Log 'OK' "Installed '$TaskName' for $TargetUser (state: $($task.State))."
     Write-Host ''
-    Write-Host 'The listener now starts with every logon and runs the display recovery on every resume.'
-    Write-Host "Listener log : $LogPath"
-    Write-Host "Recovery log  : $InstallDir\display-wake.log"
+    Write-Host 'The listener now runs the forced recovery on every resume.'
+    Write-Host 'Verify the sequence now, while the screen still works:'
+    Write-Host '    powershell -NoProfile -ExecutionPolicy Bypass -File .\FixDisplayWakeListener.ps1 -Test'
+    Write-Log 'INFO' "Listener log: $LogPath"
 }
 
 function Uninstall-Listener {
@@ -196,6 +468,10 @@ function Uninstall-Listener {
     }
 }
 
+# -------------------------------------------------------------------------------------------------
+# Resident listener
+# -------------------------------------------------------------------------------------------------
+
 function Start-Listener {
     $mutex = New-Object System.Threading.Mutex($false, 'Local\Ally2Deck-DisplayWakeListener')
     if (-not $mutex.WaitOne(0)) {
@@ -203,15 +479,9 @@ function Start-Listener {
         return 2
     }
 
-    $recovery = Get-RecoveryScript
-    if (-not $recovery) {
-        Write-Log 'ERROR' "Cannot find $RecoveryName next to $ScriptName or in $InstallDir. Nothing to run on resume."
-        return 3
-    }
-
     $sessionId = (Get-Process -Id $PID).SessionId
     Write-Log 'INFO' "===== Ally2Deck wake listener starting (PID $PID, session $sessionId) ====="
-    Write-Log 'INFO' "Recovery: $recovery (settle ${DelaySeconds}s, debounce ${DebounceSeconds}s)"
+    Write-Log 'INFO' "Forced recovery: settle ${DelaySeconds}s, debounce ${DebounceSeconds}s, NoRestart=$NoRestart"
 
     $null = Register-ObjectEvent -InputObject ([Microsoft.Win32.SystemEvents]) `
         -EventName PowerModeChanged -SourceIdentifier 'Ally2Deck.PowerMode'
@@ -238,20 +508,13 @@ function Start-Listener {
         }
         $lastHandled = Get-Date
 
-        try {
-            $arguments = @(
-                '-NoProfile',
-                '-ExecutionPolicy', 'Bypass',
-                '-WindowStyle', 'Hidden',
-                '-File', ('"{0}"' -f $recovery),
-                '-DelaySeconds', $DelaySeconds
-            ) -join ' '
+        Start-Sleep -Seconds $DelaySeconds
 
-            $process = Start-Process -FilePath 'powershell.exe' -ArgumentList $arguments -WindowStyle Hidden -PassThru
-            Write-Log 'INFO' "Resume handled: launched the display recovery (PID $($process.Id))."
+        try {
+            [void](Invoke-ForcedRecovery -Reason 'resume')
         }
         catch {
-            Write-Log 'ERROR' "Could not launch the display recovery: $($_.Exception.Message)"
+            Write-Log 'ERROR' "Forced recovery threw: $($_.Exception.Message)"
         }
     }
 }
@@ -259,6 +522,7 @@ function Start-Listener {
 try {
     if ($Uninstall) { Uninstall-Listener; exit 0 }
     if ($Install) { Install-Listener; exit 0 }
+    if ($Test) { exit (Invoke-ForcedRecovery -Reason 'manual test') }
     exit (Start-Listener)
 }
 catch {
