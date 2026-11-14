@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Resident resume listener with FORCED display recovery for Ally2Deck.
+    Resident resume listener with forced display recovery for Ally2Deck.
 
 .DESCRIPTION
     Why this exists, in order:
@@ -23,12 +23,14 @@
 
        That test cannot detect the actual failure. After the KMD loses the internal eDP link,
        Windows keeps listing the panel as an active path in its cached display config, so the
-       screen is black while every API says it is fine. The recovery then exits without doing
-       anything, which is why the log said "already active" on a black screen.
+       screen is black while every API says it is fine.
 
-    So on resume this listener ALWAYS runs the full recovery sequence - panel power-on, GDI
-    re-enumeration, topology re-apply, and (unless -NoRestart) an adapter restart - instead of
-    asking the OS whether it thinks the display is fine.
+    4. Restarting the display adapter more than once is destructive on this KMD. A second
+       pnputil /restart-device can leave the GPU in CM_PROB_FAILED_POST_START (Code 43), at
+       which point Windows falls back to the Microsoft Basic Display Adapter and stays there
+       until a reboot. So the restart is capped at ONE by default (-MaxRestarts) and the
+       device health is checked before and after it. If the driver is already in a problem
+       state, the restart is refused rather than made worse.
 
 .PARAMETER Install
     Copy the script to %ProgramData%\Ally2Deck and register a logon task. Self-elevates.
@@ -37,18 +39,22 @@
     Stop the listener, unregister its task and delete the installed copy.
 
 .PARAMETER Test
-    Run the forced recovery once, right now, and exit. Use this to check that the sequence
-    works on a healthy desktop before relying on it after a wake. The screen blanks for a few
-    seconds while the adapter restarts - that is expected.
+    Run the forced recovery once, right now, and exit. The screen blanks once while the
+    adapter restarts - that is expected.
 
 .PARAMETER NoRestart
     Never restart the display adapter. Only power the panel on and re-apply the topology.
+    Use this to find out whether the restart is needed at all.
+
+.PARAMETER MaxRestarts
+    Maximum adapter restarts per recovery. Default 1. Values above 1 are not recommended on
+    this driver: the second restart is what produces Code 43.
 
 .EXAMPLE
     powershell -NoProfile -ExecutionPolicy Bypass -File .\FixDisplayWakeListener.ps1 -Install
 
 .EXAMPLE
-    powershell -NoProfile -ExecutionPolicy Bypass -File .\FixDisplayWakeListener.ps1 -Test
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\FixDisplayWakeListener.ps1 -Test -NoRestart
 #>
 [CmdletBinding()]
 param(
@@ -60,6 +66,7 @@ param(
     [int]$DelaySeconds = 4,
     [int]$DebounceSeconds = 20,
     [int]$TimeoutSeconds = 90,
+    [int]$MaxRestarts = 1,
     [switch]$NoRestart,
     [string]$TargetUser = "$env:USERDOMAIN\$env:USERNAME"
 )
@@ -141,6 +148,10 @@ public static class AllyForcedDisplay
     private static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint msg, IntPtr wParam,
         IntPtr lParam, uint flags, uint timeout, out IntPtr result);
 
+    [DllImport("user32.dll")]
+    private static extern int SetDisplayConfig(uint pathCount, IntPtr paths,
+        uint modeCount, IntPtr modes, uint flags);
+
     private static int CountPaths(uint flags)
     {
         uint pathCount = 0;
@@ -208,10 +219,6 @@ public static class AllyForcedDisplay
         return SetDisplayConfig(0, IntPtr.Zero, 0, IntPtr.Zero,
             SDC_TOPOLOGY_EXTEND | SDC_APPLY | SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE);
     }
-
-    [DllImport("user32.dll")]
-    private static extern int SetDisplayConfig(uint pathCount, IntPtr paths,
-        uint modeCount, IntPtr modes, uint flags);
 }
 '@
 
@@ -235,6 +242,23 @@ function Get-AllyGpuDevice {
 
     if ($amd.Count -gt 0) { return ($amd | Select-Object -First 1) }
     return ($devices | Select-Object -First 1)
+}
+
+function Get-GpuHealth {
+    $gpu = Get-AllyGpuDevice
+    if (-not $gpu) { return $null }
+
+    $problem = $gpu.Problem
+    if (-not $problem) { $problem = 'CM_PROB_NONE' }
+
+    return [pscustomobject]@{
+        Device     = $gpu
+        Problem    = "$problem"
+        Healthy    = ("$problem" -eq 'CM_PROB_NONE')
+        Friendly   = $gpu.FriendlyName
+        InstanceId = $gpu.InstanceId
+        Status     = $gpu.Status
+    }
 }
 
 function Get-PathCounts {
@@ -321,19 +345,24 @@ function Invoke-ForcedRecovery {
     param([string]$Reason = 'resume')
 
     $started = Get-Date
-    $gpu = Get-AllyGpuDevice
+    $health = Get-GpuHealth
 
-    if (-not $gpu) {
+    if (-not $health) {
         Write-Log 'ERROR' "$Reason : no display adapter found (is the driver loaded?)."
         return 2
     }
 
     $before = Get-PathCounts
-    Write-Log 'INFO' "$Reason : GPU $($gpu.FriendlyName) status=$($gpu.Status); paths available=$($before.Available) active=$($before.Active)"
+    Write-Log 'INFO' "$Reason : GPU $($health.Friendly) status=$($health.Status) problem=$($health.Problem); paths available=$($before.Available) active=$($before.Active)"
+
+    if (-not $health.Healthy) {
+        Write-Log 'ERROR' "$Reason : the display driver is already in a problem state ($($health.Problem)). Refusing to touch the adapter - restart the machine. If this persists, uninstall the display device with driver removal and reinstall the driver package."
+        return 1
+    }
 
     $restarts = 0
 
-    for ($attempt = 1; $attempt -le 3; $attempt++) {
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
         # 1) Panel out of DPMS off, and make GDI re-enumerate from the driver.
         [AllyForcedDisplay]::WakeMonitor()
         $reset = [AllyForcedDisplay]::ResetDisplaySettings()
@@ -345,19 +374,27 @@ function Invoke-ForcedRecovery {
         Start-Sleep -Milliseconds 1200
 
         # 3) Last resort: make the driver re-run its start routine and re-train eDP.
+        #    Exactly one attempt by default - a second restart is what causes Code 43.
         if ($NoRestart) {
             Write-Log 'WARN' 'NoRestart is set, so the adapter will not be restarted.'
             break
         }
 
-        if ($restarts -ge 2) {
-            Write-Log 'WARN' 'Adapter already restarted twice; stopping here.'
+        if ($restarts -ge $MaxRestarts) {
+            Write-Log 'WARN' "Adapter restart limit reached ($MaxRestarts). Not restarting again - a second restart can leave the GPU in Code 43."
             break
         }
 
         $restarts++
-        Write-Log 'INFO' "Attempt #$attempt adapter restart $restarts of 2."
-        [void](Restart-DisplayAdapter -Device $gpu)
+        Write-Log 'INFO' "Attempt #$attempt adapter restart $restarts of $MaxRestarts."
+        [void](Restart-DisplayAdapter -Device $health.Device)
+
+        # Check immediately: if the restart damaged the device, stop and say so plainly.
+        $afterRestart = Get-GpuHealth
+        if ($afterRestart -and -not $afterRestart.Healthy) {
+            Write-Log 'ERROR' "Adapter restart left the GPU in $($afterRestart.Problem). Windows will fall back to the Microsoft Basic Display Adapter. Reboot to recover; if it survives the reboot, uninstall the display device (with driver removal) and reinstall the package."
+            return 1
+        }
 
         # A restart leaves the panel powered down often enough that the sequence has to repeat.
         [AllyForcedDisplay]::WakeMonitor()
@@ -368,8 +405,11 @@ function Invoke-ForcedRecovery {
     }
 
     $after = Get-PathCounts
+    $final = Get-GpuHealth
     $elapsed = [int]((Get-Date) - $started).TotalSeconds
-    Write-Log 'OK' "$Reason : forced recovery finished in $elapsed s after $restarts adapter restart(s); paths available=$($after.Available) active=$($after.Active). If the picture is back, sleep/wake again to confirm it repeats."
+    $problemText = if ($final) { $final.Problem } else { 'unknown' }
+
+    Write-Log 'OK' "$Reason : forced recovery finished in $elapsed s after $restarts adapter restart(s); GPU problem=$problemText, paths available=$($after.Available) active=$($after.Active). If the picture is back, sleep/wake again to confirm it repeats."
 
     return 0
 }
@@ -381,7 +421,7 @@ function Invoke-ForcedRecovery {
 function Install-Listener {
     if (-not (Test-IsAdmin)) {
         Write-Host 'Elevating to register the listener task...'
-        Invoke-ElevatedSelf -Arguments "-Install -InstallDir `"$InstallDir`" -DelaySeconds $DelaySeconds -TargetUser `"$TargetUser`""
+        Invoke-ElevatedSelf -Arguments "-Install -InstallDir `"$InstallDir`" -DelaySeconds $DelaySeconds -MaxRestarts $MaxRestarts -TargetUser `"$TargetUser`""
         return
     }
 
@@ -402,7 +442,7 @@ function Install-Listener {
     }
 
     $powershell = Join-Path -Path $env:SystemRoot -ChildPath 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$destination`" -DelaySeconds $DelaySeconds -TargetUser `"$TargetUser`""
+    $arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$destination`" -DelaySeconds $DelaySeconds -MaxRestarts $MaxRestarts -TargetUser `"$TargetUser`""
 
     $action = New-ScheduledTaskAction -Execute $powershell -Argument $arguments
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $TargetUser
@@ -427,9 +467,9 @@ function Install-Listener {
     Start-Sleep -Seconds 2
 
     $task = Get-ScheduledTask -TaskName $TaskName
-    Write-Log 'OK' "Installed '$TaskName' for $TargetUser (state: $($task.State))."
+    Write-Log 'OK' "Installed '$TaskName' for $TargetUser (state: $($task.State), max adapter restarts: $MaxRestarts)."
     Write-Host ''
-    Write-Host 'The listener now runs the forced recovery on every resume.'
+    Write-Host 'The listener now runs the forced recovery on every resume, with one adapter restart maximum.'
     Write-Host 'Verify the sequence now, while the screen still works:'
     Write-Host '    powershell -NoProfile -ExecutionPolicy Bypass -File .\FixDisplayWakeListener.ps1 -Test'
     Write-Log 'INFO' "Listener log: $LogPath"
@@ -481,7 +521,7 @@ function Start-Listener {
 
     $sessionId = (Get-Process -Id $PID).SessionId
     Write-Log 'INFO' "===== Ally2Deck wake listener starting (PID $PID, session $sessionId) ====="
-    Write-Log 'INFO' "Forced recovery: settle ${DelaySeconds}s, debounce ${DebounceSeconds}s, NoRestart=$NoRestart"
+    Write-Log 'INFO' "Forced recovery: settle ${DelaySeconds}s, debounce ${DebounceSeconds}s, max restarts $MaxRestarts, NoRestart=$NoRestart"
 
     $null = Register-ObjectEvent -InputObject ([Microsoft.Win32.SystemEvents]) `
         -EventName PowerModeChanged -SourceIdentifier 'Ally2Deck.PowerMode'
